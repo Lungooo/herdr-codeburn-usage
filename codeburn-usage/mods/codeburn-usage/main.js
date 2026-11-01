@@ -1,17 +1,28 @@
 // Token usage from codeburn: totals, models and devices across every paired device.
 // One `codeburn status --scope combined --combined-details` per refresh; codeburn does the indexing.
+// Plans (`codeburn plan`) are this machine's settings, but their usage is summed over every device
+// here: codeburn's own plan numbers count this machine only.
 // Each range's last answer is kept in shared state (memory, saved by Herdr), so the dialog opens
 // with numbers at once and the status strip keeps today warm for it.
-import { View, div } from "gpui-kit";
+import { View, div, svg, image } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { exec, theme, shared, setShared, home, props, run, closeOverlay } from "herdr";
-import { RANGES, ALL, codeburnArgs, parsePayload, slim, summarize, fmtTokens, fmtCount, fmtCost, fmtAgo, tildify } from "./store.js";
+import { exec, theme, shared, setShared, home, props, run, closeOverlay, knownAgents } from "herdr";
+import { RANGES, ALL, codeburnArgs, parsePayload, slim, summarize, fmtTokens, fmtCount, fmtCost, fmtAgo, tildify,
+  planArgs, localPlanArgs, parsePlans, planNeeds, slimProviders, planUsages, fmtBudget, fmtShortDate, PROVIDER_LABELS } from "./store.js";
 
 const TICK = 15000, STALE = 60000;
 const MODELS = 12, PROJECTS = 10;
 // Fixed numeric columns so rows line up in a proportional UI font.
 const COL = { req: 56, tokens: 84, cost: 76 };
 const STAT_COL = 120;
+// Plan inputs: the plan list and the ranges up to yesterday go stale slowly; past days only change
+// when a device was unreachable when they were read.
+const PLAN_LIST_STALE = 10 * 60000, PLAN_RANGE_STALE = 15 * 60000, PLAN_DAY_RETRY = 10 * 60000;
+// Provider icons as the quota mod draws them: the app's program table, else the shipped icon.
+const ICONS = { claude: "claude", codex: "codex", grok: "grok", copilot: "copilot", cursor: "cursor", antigravity: "antigravity" };
+const TINT = { claude: "#d97757", copilot: "#8f6bf2" };
+// Shipped icons that are full-color pictures, for before (or without) the program table.
+const PICTURES = new Set(["codex", "antigravity"]);
 
 // The status-bar copy (layout props `{"bar": true}`) always shows today, every device.
 const isBar = () => !!props()?.bar;
@@ -25,9 +36,16 @@ const cached = period => {
   const c = shared(cacheKey(period));
   return c?.payload && typeof c.at === "number" ? c : null;
 };
+// { at, plans, error, ranges: {from: {at, to, data}}, days: {date: {at, data}}, copilot: {at, plan} }
+const PLANS = "codeburn-usage.plans";
+const planCache = () => shared(PLANS);
+const planNow = () => Date.now();
 
-async function runCodeburn(period) {
-  const args = codeburnArgs(period);
+const rangeStale = (e, to, now) => !e || e.to !== to || now - e.at > PLAN_RANGE_STALE;
+const dayStale = (e, now) => !e || (e.data.devices.some(d => d.error) && now - e.at > PLAN_DAY_RETRY);
+const failure = r => (r.stderr || r.stdout || `codeburn exited ${r.code}`).trim().split("\n").pop();
+
+async function runCodeburn(args) {
   try {
     return await exec("codeburn", args);
   } catch (e) {
@@ -38,6 +56,9 @@ async function runCodeburn(period) {
   }
 }
 
+const planColor = (t, p) => p.status === "over" ? t.blocked : p.status === "near" ? t.working : t.done;
+const resetText = days => days <= 1 ? "Resets tomorrow" : `Resets in ${days} days`;
+
 export default class CodeburnUsage extends View {
   // While the dialog is open every whole-window redraw is slow (0.5–1 s measured), so nothing
   // redraws on its own then: the dialog has no clock, and the strip pauses its refresh.
@@ -45,10 +66,21 @@ export default class CodeburnUsage extends View {
     this.errors = {};    // period -> last refresh error (the cached numbers stay)
     this.busy = null;    // period being fetched
     this.again = false;  // Refresh pressed while busy
+    this.planBusy = false; this.planAgain = false; this.planError = null;
+    // The app's program table knows each provider's icon and whether it is a one-color glyph.
+    this.programs = {};
+    cx.spawn(async cx => {
+      for (const a of await knownAgents().catch(() => [])) this.programs[a.key] = a;
+      cx.notify();
+    });
     // OPEN is { id, at } of the open dialog; close() is best-effort, so a stale mark expires on its own.
     if (isBar()) {
       setShared(OPEN, null);
-      cx.timer.every(TICK, cx => { if (Date.now() - (shared(OPEN)?.at ?? 0) > PAUSE_MAX) this.maybeRefresh(cx); });
+      cx.timer.every(TICK, cx => {
+        if (Date.now() - (shared(OPEN)?.at ?? 0) <= PAUSE_MAX) return;
+        this.maybeRefresh(cx);
+        this.refreshPlans(cx);
+      });
     } else {
       // The key toggles: opening while one is open closes both. A mark left by a dialog that is
       // already gone (Herdr quit with it open) costs one extra press, since it is cleared here too.
@@ -60,6 +92,7 @@ export default class CodeburnUsage extends View {
       } else setShared(OPEN, { id, at: Date.now() });
     }
     this.maybeRefresh(cx);
+    this.refreshPlans(cx);
   }
 
   async close() {
@@ -80,9 +113,9 @@ export default class CodeburnUsage extends View {
     // No redraw to say "refreshing": one redraw when the numbers arrive.
     this.busy = period;
     cx.spawn(async cx => {
-      const r = await runCodeburn(period);
+      const r = await runCodeburn(codeburnArgs(period));
       let payload = null, error = null;
-      if (r.code !== 0) error = (r.stderr || r.stdout || `codeburn exited ${r.code}`).trim().split("\n").pop();
+      if (r.code !== 0) error = failure(r);
       else try { payload = parsePayload(r.stdout); } catch (e) { error = `unreadable codeburn output: ${e}`; }
       if (!payload && !error) error = "codeburn printed nothing";
       this.errors[period] = error;
@@ -93,6 +126,61 @@ export default class CodeburnUsage extends View {
     });
   }
 
+  // Plan inputs, one codeburn run at a time: the plan list, then each range up to yesterday, then each
+  // past day of the projection window. Each answer is written as it arrives; what is no longer needed
+  // is dropped. Without force, only what is stale runs, and nothing at all when nothing is.
+  refreshPlans(cx, force = false) {
+    if (this.planBusy) { this.planAgain = this.planAgain || force; return; }
+    const now = Date.now(), c0 = planCache();
+    const listStale = force || !c0?.plans || now - (c0.at ?? 0) > PLAN_LIST_STALE;
+    if (!listStale) {
+      const needs = planNeeds(c0.plans, new Date(now));
+      const stale = Object.entries(needs.ranges).some(([from, to]) => rangeStale(c0.ranges?.[from], to, now))
+        || needs.days.some(d => dayStale(c0.days?.[d], now))
+        || (needs.copilot && (!c0.copilot || now - c0.copilot.at > PLAN_RANGE_STALE));
+      if (!stale) return;
+    }
+    this.planBusy = true;
+    cx.spawn(async cx => {
+      let c = { ...(planCache() ?? {}) }, error = null;
+      const save = change => { c = { ...c, ...change }; setShared(PLANS, c); };
+      const ask = async args => {
+        const r = await runCodeburn(args);
+        if (r.code !== 0) { error = failure(r); return null; }
+        try { return parsePayload(r.stdout); } catch (e) { error = `unreadable codeburn output: ${e}`; return null; }
+      };
+      try {
+        if (listStale) {
+          const r = await runCodeburn(planArgs());
+          if (r.code !== 0) error = failure(r);
+          else try { save({ at: Date.now(), plans: parsePlans(r.stdout) }); } catch (e) { error = `unreadable codeburn plan output: ${e}`; }
+        }
+        const needs = planNeeds(c.plans ?? [], new Date());
+        const keep = (all, keys) => Object.fromEntries(keys.filter(k => all?.[k]).map(k => [k, all[k]]));
+        save({ ranges: keep(c.ranges, Object.keys(needs.ranges)), days: keep(c.days, needs.days), ...(needs.copilot ? {} : { copilot: null }) });
+        for (const [from, to] of Object.entries(needs.ranges)) {
+          if (!force && !rangeStale(c.ranges[from], to, Date.now())) continue;
+          const payload = await ask(codeburnArgs({ from, to }));
+          if (payload) save({ ranges: { ...c.ranges, [from]: { at: Date.now(), to, data: slimProviders(payload) } } });
+        }
+        for (const day of needs.days) {
+          if (!force && !dayStale(c.days[day], Date.now())) continue;
+          const payload = await ask(codeburnArgs({ day }));
+          if (payload) save({ days: { ...c.days, [day]: { at: Date.now(), data: slimProviders(payload) } } });
+        }
+        if (needs.copilot && (force || !c.copilot || Date.now() - c.copilot.at > PLAN_RANGE_STALE)) {
+          const payload = await ask(localPlanArgs());
+          if (payload) save({ copilot: { at: Date.now(), plan: payload.plans?.copilot ?? null } });
+        }
+      } finally {
+        this.planError = error;
+        this.planBusy = false;
+        if (this.planAgain) { this.planAgain = false; this.refreshPlans(cx, true); }
+        cx.notify();
+      }
+    });
+  }
+
   render(cx) {
     this.now = Date.now();
     const t = theme();
@@ -100,7 +188,9 @@ export default class CodeburnUsage extends View {
     const c = cached(period);
     const entry = c || this.errors[period] ? { at: c?.at, error: this.errors[period] ?? null } : null;
     const s = c ? summarize(c.payload, device()) : null;
-    if (isBar()) return this.strip(t, entry, s);
+    const today = cached("today")?.payload;
+    const plans = planUsages(planCache(), today, new Date(planNow()), today?.currency ?? s?.currency);
+    if (isBar()) return this.strip(t, entry, s, plans);
     if (entry?.at) this.tickStamp(entry.at, cx);
 
     // The overlay covers the whole window without Herdr's frame; the panel draws its own and sizes
@@ -114,19 +204,26 @@ export default class CodeburnUsage extends View {
       .when(!!s, el => el.child(this.stats(t, s).flex_none().h(0).px(16).overflow_hidden()))
       .child(fill(this.header(t, entry)))
       .child(fill(this.chips(t, period)))
-      .child(fill(s ? this.body(t, s) : this.empty(t, entry)))
+      .child(fill(s ? this.body(t, s, plans) : this.empty(t, entry)))
       .child(fill(this.footer(t, entry, s)));
     return div().id("root").size_full().flex().items_center().justify_center()
       .on_mouse_down("left", () => closeOverlay(props()?.overlay))
       .child(panel);
   }
 
-  // One line in the status bar: today's spend and tokens over every device. Click for the panel.
-  strip(t, entry, s) {
+  // One line in the status bar: today's spend and tokens over every device, then each plan's share
+  // of its budget. Click for the panel.
+  strip(t, entry, s, plans) {
     const stale = !entry?.at || this.now - entry.at > 3 * STALE;
-    const tip = s
-      ? s.devices.map(d => `${d.name}: ${d.error ? `unreachable (${d.error})` : `${fmtCost(d.totals.cost, s.currency)} · ${fmtTokens(d.totals.totalTokens)}`}`).join("\n")
-      : entry?.error ?? "codeburn usage";
+    const currency = s?.currency;
+    const tip = [
+      s ? s.devices.map(d => `${d.name}: ${d.error ? `unreachable (${d.error})` : `${fmtCost(d.totals.cost, s.currency)} · ${fmtTokens(d.totals.totalTokens)}`}`).join("\n")
+        : entry?.error ?? "codeburn usage",
+      ...plans.map(p => `${p.name}: ${fmtCost(p.spent, currency)} of ${fmtBudget(p.budget, currency)} (${Math.round(p.percent)}%)`
+        + (p.projected ? ` · projected ${fmtCost(p.projected, currency)}` : "")
+        + (p.daysUntilReset !== null ? ` · ${resetText(p.daysUntilReset).toLowerCase()}` : "")
+        + (p.localOnly ? " · this device" : "")),
+    ].join("\n");
     // The content measures itself and the block is resized to it: 11 px left, then 11 px and a
     // 1 px separator on the right (the quota strip adds its own 11 px after it).
     const content = h_flex().id("codeburn-strip-content").flex_none().gap(6).items_center()
@@ -139,7 +236,13 @@ export default class CodeburnUsage extends View {
         .child(div().flex_none().text_color(t.dim).child("·"))
         .child(div().flex_none().child(fmtTokens(s.totals.totalTokens)))
         .when(s.reachable < s.devices.length, el => el.child(div().flex_none().text_color(t.blocked)
-          .child(`${s.devices.length - s.reachable} offline`))));
+          .child(`${s.devices.length - s.reachable} offline`))))
+      .children(plans.flatMap((p, i) => [
+        div().flex_none().text_color(t.dim).child("·"),
+        h_flex().id(`strip-plan-${i}`).flex_none().gap(4).items_center()
+          .child(this.glyph(p.provider, 12, t))
+          .child(div().flex_none().text_color(planColor(t, p)).child(`${Math.round(p.percent)}%`)),
+      ]));
     return h_flex().id("codeburn-strip").size_full().pl(11).gap(11).items_center().overflow_hidden()
       .bg(t.chrome).border_t(1).border_color(t.border).text_size(11.5).text_color(t.muted).cursor_pointer()
       .when(stale, el => el.opacity(0.6))
@@ -178,7 +281,7 @@ export default class CodeburnUsage extends View {
       .child(h_flex().id("refresh").flex_none().h(22).px(9).rounded(6).items_center()
         .bg(t.raised).text_size(11.5).text_color(t.muted)
         .hover(st => st.bg(t.hover).text_color(t.foreground))
-        .on_click((_e, cx) => this.refresh(cx, true))
+        .on_click((_e, cx) => { this.refresh(cx, true); this.refreshPlans(cx, true); })
         .child("Refresh"));
   }
 
@@ -217,10 +320,11 @@ export default class CodeburnUsage extends View {
       .child(col(tile("Output", fmtTokens(T.outputTokens)), tile("Cost", fmtCost(T.cost, s.currency), T.cost > 0 ? t.done : t.dim)));
   }
 
-  body(t, s) {
+  body(t, s, plans) {
     // A plain scroll: inside a panel sized by its content, overflow_y_scrollbar's wrapper measures 0 tall.
     return v_flex().id("scroll").flex_shrink(1).min_h(0).overflow_y_scroll().px(16).pb(12).gap(10)
       .child(this.scope(t, s))
+      .when(plans.length > 0, el => el.child(this.plans(t, plans, s.currency)))
       .child(this.stats(t, s))
       .child(h_flex().gap(8).items_center().text_size(11.5)
         .child(div().flex_none().text_color(t.dim).child("Cache hit rate"))
@@ -244,9 +348,45 @@ export default class CodeburnUsage extends View {
         .child("All devices")));
   }
 
-  bar(t, share) {
+  bar(t, share, color = t.accent, h = 3) {
     const pct = Math.max(0, Math.min(1, share)) * 100;
-    return div().h(3).rounded(2).bg(t.raised).child(div().h(3).rounded(2).bg(t.accent).w(`${pct}%`));
+    return div().h(h).rounded(2).bg(t.raised).child(div().h(h).rounded(2).bg(color).w(`${pct}%`));
+  }
+
+  // A provider's icon (as the quota mod draws it), or its name when there is none ("All").
+  glyph(provider, size, t) {
+    const program = this.programs?.[provider], icon = program?.icon ?? (ICONS[provider] ? `icons/${ICONS[provider]}.svg` : null);
+    if (!icon) return div().flex_none().text_size(size * 0.85).text_color(t.muted).child(PROVIDER_LABELS[provider] ?? provider);
+    return TINT[provider] || (program ? program.tint : !PICTURES.has(provider))
+      ? svg(icon).size(size).flex_none().text_color(TINT[provider] ?? program?.color ?? t.foreground)
+      : image(icon).size(size).flex_none().rounded(3);
+  }
+
+  // Each plan's API-equivalent spend against its budget, for this budget window (not the range chips).
+  plans(t, plans, currency) {
+    const offline = Math.max(0, ...plans.map(p => p.offline));
+    return v_flex().gap(6)
+      .child(h_flex().gap(6).items_center()
+        .child(this.title(t, "Plans · all devices"))
+        .when(offline > 0, el => el.child(div().pt(6).text_size(11.5).text_color(t.blocked).child(`${offline} offline`)))
+        .when(this.planBusy, el => el.child(div().pt(6).text_size(11.5).text_color(t.dim).child("updating…"))))
+      .when(!!this.planError, el => el.child(div().text_size(11).text_color(t.blocked).truncate().child(`Plan refresh failed: ${this.planError}`)))
+      .children(plans.map((p, i) => {
+        const color = planColor(t, p);
+        const verdict = p.status === "over" ? `${p.ratio.toFixed(1)}x the sticker price`
+          : p.status === "near" ? "Approaching budget" : "Well within budget";
+        const details = [verdict, `Projected ${fmtCost(p.projected, currency)}`,
+          ...(p.daysUntilReset !== null ? [`${resetText(p.daysUntilReset)}${p.periodEnd ? ` (${fmtShortDate(p.periodEnd)})` : ""}`] : []),
+          ...(p.localOnly ? ["this device"] : []), ...(p.incomplete && !this.planBusy ? ["partial"] : [])];
+        return v_flex().id(`plan-${i}`).gap(3)
+          .child(h_flex().gap(6).items_center().text_size(12)
+            .child(this.glyph(p.provider, 14, t))
+            .child(div().flex_1().min_w(0).truncate().child(p.name))
+            .child(div().flex_none().text_color(t.muted).child(`${fmtCost(p.spent, currency)} of ${fmtBudget(p.budget, currency)}`))
+            .child(div().flex_none().min_w(52).text_right().font_semibold().text_color(color).child(`${p.percent.toFixed(1)}%`)))
+          .child(this.bar(t, p.percent / 100, color, 4))
+          .child(div().text_size(11).text_color(t.dim).truncate().child(details.join(" · ")));
+      }));
   }
 
   title(t, text) {

@@ -2,9 +2,10 @@
 
 What your coding agents have spent, on every machine you use, in one place. A small item
 in the status bar shows today's cost and tokens, added up across all your paired devices.
-Clicking it (or `ctrl-shift-u`) opens a dialog for Today, 7 days, 30 days or All: totals,
-cache hit rate, every model merged across devices, each device's share, and this device's
-projects. The numbers come from [codeburn](https://github.com/getagentseal/codeburn), which
+If you set a subscription plan in codeburn, the item also shows how much of each plan's monthly
+budget your usage would have cost at API prices. Clicking it (or `ctrl-shift-u`) opens a dialog
+for Today, 7 days, 30 days or All: your plans against their budgets, totals, cache hit rate,
+every model merged across devices, each device's share, and this device's projects. The numbers come from [codeburn](https://github.com/getagentseal/codeburn), which
 already indexes Claude Code, Codex, Cursor, Copilot, OpenCode and others and can pull usage
 from your other machines. The panel itself indexes nothing.
 
@@ -18,6 +19,8 @@ the rest of the bar, text 11.5 px in `muted`:
 - 11 px left padding, then a dim 10 px `Today`, the cost (`done` when above zero, else `dim`),
   a dim `·`, and the total tokens (`52.23M`). Elements are 6 px apart.
 - When a paired device can't be reached, `N offline` follows in `blocked`.
+- For each codeburn plan, a dim `·`, the provider's 12 px icon (4 px gap) and the share of the budget
+  used, rounded (`144%`): `done` under 80%, `working` from 80%, `blocked` over 100%.
 - 11 px after the text comes a 1 px × 12 px `border` separator on the item's right edge, so it
   reads as its own section next to whatever follows.
 - The item sizes its own block to its text, so there is no gap after it.
@@ -25,7 +28,8 @@ the rest of the bar, text 11.5 px in `muted`:
   `blocked`.
 - When its numbers are over 3 minutes old, the whole item drops to 60% opacity.
 - Hovering shows a tooltip with one line per device (`server: $75.95 · 161.22M`, or
-  `unreachable (<error>)`) and `Click for details (ctrl-shift-u)`.
+  `unreachable (<error>)`), one per plan (`Claude Max 5x: $144.19 of $100 (144%) · projected
+  $266.90 · resets in 14 days`) and `Click for details (ctrl-shift-u)`.
 
 **Dialog.** A centered panel that fits its content: exactly as wide as the six totals tiles
 plus 16 px on each side (about 440 px), and as tall as everything in it, up to 85% of the
@@ -48,6 +52,17 @@ any numbers exist it is 380 px wide. Top to bottom:
   - **Scope line,** 11.5 px in `muted`: `Last 30 Days · All devices · 3 of 3 reachable`, or
     one device's name with `(this device)` for the local one. While narrowed to one device,
     an `All devices` pill at the right resets it.
+  - **Plans · all devices**, only when codeburn has plans. It is about each plan's monthly budget
+    window and ignores the range chips and the chosen device. The title is 12.5 px semibold, followed
+    by `N offline` in `blocked` when a device can't be reached and `updating…` in `dim` while plan
+    numbers load. A failed refresh adds `Plan refresh failed: <message>` in `blocked`. Per plan:
+    - a 14 px provider icon, the name (truncating), `$144.19 of $100` in `muted` and the percent with
+      one decimal, semibold, in a 52 px right-aligned box, colored as in the strip
+    - a 4 px bar in the same color (track `raised`), full when over budget
+    - an 11 px `dim` line: `1.4x the sticker price` (over) / `Approaching budget` (from 80%) /
+      `Well within budget`, then `Projected $266.90` and `Resets in 14 days (Nov 15)`; `this device`
+      for a Copilot plan, `partial` while some of its inputs are missing
+    - Names: codeburn's for preset plans (`Claude Max 5x`), by price for custom ones (`Codex $100/mo`).
   - **Six tiles** in three columns 24 px apart, 10 px between the rows: `Total tokens` over
     `Cache read`, `Input` over `Requests`, `Output` over `Cost`. Each column is as wide as its
     widest label or value, at least 120 px (so model names keep room beside the number columns),
@@ -96,6 +111,23 @@ the only graphics. Nothing animates.
   - The dialog opens with the cached numbers at once.
   - It runs codeburn only when that range is over 60 s old, when you pick another range, or on
     Refresh. Refresh always runs codeburn, even with fresh numbers.
+- **Plans.** Plans are codeburn's settings on this machine: `codeburn plan set claude-max-5x
+  --reset-day 15`, or for a plan without a preset, `codeburn plan set custom --provider codex
+  --monthly-usd 100 --reset-day 20`. codeburn computes plan usage from this machine's logs only,
+  so the mod sums every reachable device itself, with codeburn's math:
+  - The budget window runs from the reset day (1–28) at local midnight to the same day next month.
+  - Spent is the window's API-equivalent cost for that provider (`all`: every provider), summed
+    over reachable devices: the window up to yesterday from one ranged call, plus today from the
+    live Today numbers (so it moves every minute).
+  - Percent is spent ÷ budget; "N.Nx the sticker price" is spent ÷ max(budget, 1).
+  - Projected is spent + the median of the window's last (up to) 7 days, today and empty days
+    included, × (days until reset − 1).
+  - A Copilot plan counts AI credits, which only this machine's logs carry, so it shows
+    codeburn's own local numbers, marked `this device`.
+- **Plan refresh.** The plan list is read again after 10 minutes. The window up to yesterday is read
+  again after 15 minutes or when the date changes. Each past day of the projection is read once, and
+  again after 10 minutes only if a device couldn't be reached that time. Inputs that are no longer
+  needed are dropped. Refresh reads all of them again.
 - **Background refresh.** The status item checks every 15 s and refreshes Today when it is
   over 60 s old, so opening the dialog on Today rarely waits.
   - It pauses while the dialog is open, so nothing redraws underneath it.
@@ -130,7 +162,7 @@ the only graphics. Nothing animates.
   - the formatters `fmtTokens`, `fmtCount`, `fmtCost`, `fmtAgo` and `tildify`
 - **`mods/codeburn-usage/main.js`:** the View. `isBar()` picks the status item or the dialog;
   then come the refresh logic, the toggle and the drawing.
-- **Data source.** One program, run through `exec`:
+- **Data source.** One program, run through `exec`, for usage:
   `codeburn status --format menubar-json --scope combined --combined-details --period
   <today|week|30days|lifetime> --no-optimize --no-timeline`. It takes 0.7–1.2 s and prints
   50–150 KB.
@@ -143,8 +175,18 @@ the only graphics. Nothing animates.
   - All costs are USD; `currency.rate` and `currency.symbol` convert them for display.
   - If `codeburn` isn't on Herdr's PATH, it retries through the login shell
     (`$SHELL -lic 'codeburn …'`).
+  - For plans: `codeburn plan --format json` (`{plans: {claude: {id, monthlyUsd, provider,
+    resetDay}}}`), the same status call with `--from <window start> --to <yesterday>` and with
+    `--day <date>` instead of `--period`, and `codeburn status --format json` (its local `plans.copilot`)
+    only for a Copilot plan. Every device's payload carries `current.providers`, its cost per provider.
+  - The plan cache is shared state `codeburn-usage.plans`: `{at, plans, ranges: {<from>: {at, to,
+    data}}, days: {<date>: {at, data}}, copilot}`. Its `data` is per device `{id, name, local, error,
+    providers}`. `store.js`'s `planNeeds` says what to read and `planUsages` does the math.
 - **`herdr` functions:**
   - `exec`, `theme`, `shared` / `setShared`, `props`, `home`, `closeOverlay`
+  - `knownAgents()` for the provider icons, as the quota mod draws them: the program table's icon
+    (`svg` tinted when it is a glyph, else `image`), else the shipped `icons/<provider>.svg`.
+    Claude is tinted `#d97757`; `codex.svg` and `antigravity.svg` are full-color pictures. Provider `all` shows `All` as text.
   - `run("mod.open", {name})` for the status item's click
   - `run("layout.resize", {id: props().block ?? "status-codeburn", px})` for its width,
     measured with `on_size_change` on its content
@@ -205,6 +247,19 @@ the only graphics. Nothing animates.
 - **Toggle mechanics.** On open, a dialog reads `codeburn-usage.dialog-open` (`{id, at}`). If
   another id is there, it closes that one and itself and clears the mark. Otherwise it writes
   its own id. Only the dialog whose id is in the mark clears it on close.
+- **Plans in codeburn are this machine's only.** `codeburn status --format json` has `plan`/`plans`,
+  but from local logs, and it can't be combined with `--scope combined`. The menubar payload has no
+  plan data at all. So the mod reads the plan list and sums `current.providers` over devices itself.
+  `history.daily` has no per-provider split, which is why the projection needs one `--day` call per
+  past day.
+- **codeburn's plan view can read higher than the mod.** For the same window, codeburn's plan
+  path parsed sessions again from scratch and reported about 10% more for this machine than its own
+  `status`/`--day` totals. The mod matches the status totals, like everything else it shows.
+- **The first plan load takes a while:** one call for the plan list, one per distinct window start
+  and up to 6 day calls, about 3.7 s each with paired devices. They run one after another in the
+  background, and each answer shows as it arrives.
+- **The Today payload must be today's.** Just after midnight the cached Today numbers are
+  yesterday's. `planUsages` checks the date in its label and counts them as nothing until refreshed.
 - **Write `mod.json` before `main.js`.** A folder Herdr sees without `"place": "none"` gets
   docked into the shown layout as a column on its own.
 - **Some themes give `hover` the same color as `raised`.** The chips use `selected` for hover
@@ -218,6 +273,7 @@ the only graphics. Nothing animates.
   - Remote devices that can't be reached within codeburn's 8 s fetch timeout show as
     unreachable for that refresh.
 - **Limits:** 12 models, 10 projects, a 60 s freshness window, and a 5-minute maximum pause.
+  Plans: codeburn's providers (all, claude, codex, cursor, grok, copilot, antigravity), one plan each.
 
 ## Done when
 
@@ -243,6 +299,27 @@ the only graphics. Nothing animates.
   ```
 
   The two printed costs are equal.
+- With a plan set, the strip shows its icon and percent, and the dialog's Plans section shows the
+  same percent. Its spent equals the sum, over every reachable device, of `current.providers.<provider>`
+  from one `--day` call per day of the window:
+
+  ```sh
+  node --input-type=module -e "
+    import {execFileSync as x} from 'child_process';
+    const s = await import('$HOME/.config/herdr-app/mods/codeburn-usage/store.js');
+    const run = a => s.parsePayload(x('codeburn', a, {encoding: 'utf8', maxBuffer: 1 << 28}));
+    const now = new Date(), plans = s.parsePlans(x('codeburn', s.planArgs(), {encoding: 'utf8'}));
+    const need = s.planNeeds(plans, now), cache = {plans, ranges: {}, days: {}};
+    for (const [from, to] of Object.entries(need.ranges)) cache.ranges[from] = {to, data: s.slimProviders(run(s.codeburnArgs({from, to})))};
+    for (const day of need.days) cache.days[day] = {data: s.slimProviders(run(s.codeburnArgs({day})))};
+    const p = s.planUsages(cache, s.slim(run(s.codeburnArgs('today'))), now)[0];
+    let sum = 0;
+    for (let d = s.planPeriod(p.plan.resetDay, now).start; d <= now; d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1))
+      sum += s.providerSpend(s.slimProviders(run(s.codeburnArgs({day: s.localDate(d)}))), p.provider).cost;
+    console.log(p.spent.toFixed(2), sum.toFixed(2));"
+  ```
+
+  The two printed costs are equal, give or take a session still running between the reads.
 - `codeburn devices --format json -p 30days` lists the same devices as the dialog's Devices
   section on 30 days. Remote costs are identical. The local device can be slightly higher if an
   agent session is still running between the two reads.

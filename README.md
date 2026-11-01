@@ -6,9 +6,13 @@ you use, in one place.
 ![Codeburn usage](codeburn-usage/preview.png)
 
 - **Status bar:** a small item shows today's cost and tokens, added up across all your
-  devices. Hover it for a per-device breakdown.
+  devices, and for each codeburn plan its icon and how much of the monthly budget you've used.
+  Hover it for a per-device and per-plan breakdown.
 - **Dialog:** click the item or press `ctrl-shift-u` to open it, and press either again (or
   Esc) to close it. It covers Today, 7 days, 30 days or All:
+  - your plans: API-equivalent spend against each budget over all devices, as a bar and a
+    percentage, how many times the sticker price that is, the projected month-end figure and when
+    the budget resets
   - totals: total tokens, input, output, cache read, requests and cost
   - cache hit rate
   - every model, merged across devices, with its requests, tokens and cost
@@ -17,10 +21,23 @@ you use, in one place.
 - **Fast to open:** numbers are cached per range, so the dialog opens with data at once and
   refreshes in the background when they are more than a minute old.
 
+**Plans** are set in codeburn on the machine running Herdr:
+
+```sh
+codeburn plan set claude-max-5x --reset-day 15
+codeburn plan set custom --provider codex --monthly-usd 100 --reset-day 20   # no preset: named "Codex $100/mo"
+```
+
+codeburn's own plan numbers count this machine only. The mod sums your usage on every paired device
+instead, with the same math. Copilot plans count AI credits only codeburn on this machine can read,
+so they show codeburn's local numbers.
+
 The data comes from [codeburn](https://github.com/getagentseal/codeburn). It already reads
 the usage logs of Claude Code, Codex, Cursor, Copilot, OpenCode and other agents, prices them
 per model, and can pull usage from your other machines. The mod runs one
 `codeburn status --scope combined --combined-details` per refresh and indexes nothing itself.
+With plans set, it also reads them (`codeburn plan --format json`) and runs a few more of those
+status calls for the budget window, mostly once per day.
 
 ## Requirements
 
