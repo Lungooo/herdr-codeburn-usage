@@ -18,7 +18,8 @@ the rest of the bar, text 11.5 px in `muted`:
 
 - 11 px left padding, then a dim 10 px `Today`, the cost (`done` when above zero, else `dim`),
   a dim `·`, and the total tokens (`52.23M`). Elements are 6 px apart.
-- When a paired device can't be reached, `N offline` follows in `blocked`.
+- When a paired device can't be reached, `N offline` follows in `blocked`. The totals still count
+  it with its last cached numbers (see "Offline devices").
 - For each codeburn plan, a dim `·`, the provider's 12 px icon (4 px gap) and the share of the budget
   used, rounded (`144%`): `done` under 80%, `working` from 80%, `blocked` over 100%.
 - 11 px after the text comes a 1 px × 12 px `border` separator on the item's right edge, so it
@@ -27,9 +28,9 @@ the rest of the bar, text 11.5 px in `muted`:
 - Before the first answer it shows `…`. If codeburn fails it shows `codeburn unavailable` in
   `blocked`.
 - When its numbers are over 3 minutes old, the whole item drops to 60% opacity.
-- Hovering shows a tooltip with one line per device (`server: $75.95 · 161.22M`, or
-  `unreachable (<error>)`), one per plan (`Claude Max 5x: $144.19 of $100 (144%) · projected
-  $266.90 · resets in 14 days`) and `Click for details (ctrl-shift-u)`.
+- Hovering shows a tooltip with one line per device (`server: $108.04 · 220.02M`, or
+  `unreachable (<error>)`, or `laptop: $26.91 · 78.20M (offline, cached 2h ago)`), one per plan (`Claude Max 5x: $144.19 of $100 (144%) · projected
+  $266.90 · resets in 14 days`, plus ` · cached data from 2h ago` when it uses cached numbers) and `Click for details (ctrl-shift-u)`.
 
 **Dialog.** A centered panel that fits its content: exactly as wide as the six totals tiles
 plus 16 px on each side (about 440 px), and as tall as everything in it, up to 85% of the
@@ -49,12 +50,14 @@ any numbers exist it is 380 px wide. Top to bottom:
   - The others are `raised` with `muted` text and turn `selected`/`foreground` on hover.
   - All four show a pointer cursor.
 - **Scroll area** (no visible scrollbar), 16 px side padding, 10 px between blocks, ending in a 12 px bottom pad:
-  - **Scope line,** 11.5 px in `muted`: `Last 30 Days · All devices · 3 of 3 reachable`, or
+  - **Scope line,** 11.5 px in `muted`: `Last 30 Days · All devices · 3 of 3 reachable` (plus ` · 1 cached`
+    when offline devices count with cached numbers), or
     one device's name with `(this device)` for the local one. While narrowed to one device,
     an `All devices` pill at the right resets it.
   - **Plans · all devices**, only when codeburn has plans. It is about each plan's monthly budget
     window and ignores the range chips and the chosen device. The title is 12.5 px semibold, followed
-    by `N offline` in `blocked` when a device can't be reached and `updating…` in `dim` while plan
+    by `N offline` in `blocked` when a device can't be reached and has no cached numbers,
+    `cached 2h ago` in `blocked` (the oldest cached number used, joined with ` · `) and `updating…` in `dim` while plan
     numbers load. A failed refresh adds `Plan refresh failed: <message>` in `blocked`. Per plan:
     - a 14 px provider icon, the name (truncating), `$144.19 of $100` in `muted` and the percent with
       one decimal, semibold, in a 52 px right-aligned box, colored as in the strip
@@ -81,8 +84,12 @@ any numbers exist it is 380 px wide. Top to bottom:
       tokens. With none: `No model data in this range`.
   - **Devices:** the same columns, one row per paired device, local first.
     - The local device carries a dim 11 px `this device` tag.
-    - Each row has a 3 px `accent` bar for its share of the reachable devices' tokens.
-    - An unreachable device shows `unreachable: <error>` in `blocked` instead of numbers.
+    - Each row has a 3 px `accent` bar for its share of the counted devices' tokens (reachable,
+      or offline with cached numbers).
+    - An offline device with cached numbers shows them like a reachable one, with an 11 px line
+      under its bar in `blocked`: `offline · cached 2h ago` (age of its last successful read).
+    - An unreachable device without cached numbers shows `unreachable: <error>` in `blocked`
+      instead of numbers.
     - Rows have 4 px padding and radius 4. The chosen row is `selected`; others turn `hover`
       on hover.
   - **Projects · this device:**
@@ -111,13 +118,20 @@ the only graphics. Nothing animates.
   - The dialog opens with the cached numbers at once.
   - It runs codeburn only when that range is over 60 s old, when you pick another range, or on
     Refresh. Refresh always runs codeburn, even with fresh numbers.
+- **Offline devices.** codeburn still lists an unreachable device, with `error` and zeros. When
+  the mod writes a new answer, such a device keeps its numbers from the entry being replaced
+  (`carryOver` in `store.js`: `perDevice` totals and its `combinedDevices` payload), marked
+  `cachedAt`: when they were last read, kept across refreshes until it is back. Totals, models
+  and plans count it like a reachable device. Today's numbers are only carried within the same
+  local day; after midnight the device is unreachable until it answers. Plan range and day
+  entries do the same per device's `providers` (`carryProviders`).
 - **Plans.** Plans are codeburn's settings on this machine: `codeburn plan set claude-max-5x
   --reset-day 15`, or for a plan without a preset, `codeburn plan set custom --provider codex
   --monthly-usd 100 --reset-day 20`. codeburn computes plan usage from this machine's logs only,
   so the mod sums every reachable device itself, with codeburn's math:
   - The budget window runs from the reset day (1–28) at local midnight to the same day next month.
   - Spent is the window's API-equivalent cost for that provider (`all`: every provider), summed
-    over reachable devices: the window up to yesterday from one ranged call, plus today from the
+    over reachable devices (and offline ones with cached numbers): the window up to yesterday from one ranged call, plus today from the
     live Today numbers (so it moves every minute).
   - Percent is spent ÷ budget; "N.Nx the sticker price" is spent ÷ max(budget, 1).
   - Projected is spent + the median of the window's last (up to) 7 days, today and empty days

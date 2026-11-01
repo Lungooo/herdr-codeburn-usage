@@ -7,7 +7,7 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { exec, theme, shared, setShared, home, props, run, closeOverlay, knownAgents } from "herdr";
-import { RANGES, ALL, codeburnArgs, parsePayload, slim, summarize, fmtTokens, fmtCount, fmtCost, fmtAgo, tildify,
+import { RANGES, ALL, codeburnArgs, parsePayload, slim, carryOver, carryProviders, summarize, fmtTokens, fmtCount, fmtCost, fmtAgo, tildify,
   planArgs, localPlanArgs, parsePlans, planNeeds, slimProviders, planUsages, fmtBudget, fmtShortDate, PROVIDER_LABELS } from "./store.js";
 
 const TICK = 15000, STALE = 60000;
@@ -119,7 +119,8 @@ export default class CodeburnUsage extends View {
       else try { payload = parsePayload(r.stdout); } catch (e) { error = `unreadable codeburn output: ${e}`; }
       if (!payload && !error) error = "codeburn printed nothing";
       this.errors[period] = error;
-      if (payload) setShared(cacheKey(period), { at: Date.now(), payload: slim(payload) });
+      // A device that is offline this time keeps its last numbers from the entry this replaces.
+      if (payload) setShared(cacheKey(period), { at: Date.now(), payload: carryOver(cached(period), slim(payload), Date.now(), period) });
       this.busy = null;
       if (this.again || period !== range()) { const again = this.again; this.again = false; this.refresh(cx, again); }
       cx.notify();
@@ -161,12 +162,12 @@ export default class CodeburnUsage extends View {
         for (const [from, to] of Object.entries(needs.ranges)) {
           if (!force && !rangeStale(c.ranges[from], to, Date.now())) continue;
           const payload = await ask(codeburnArgs({ from, to }));
-          if (payload) save({ ranges: { ...c.ranges, [from]: { at: Date.now(), to, data: slimProviders(payload) } } });
+          if (payload) save({ ranges: { ...c.ranges, [from]: { at: Date.now(), to, data: carryProviders(c.ranges[from], slimProviders(payload)) } } });
         }
         for (const day of needs.days) {
           if (!force && !dayStale(c.days[day], Date.now())) continue;
           const payload = await ask(codeburnArgs({ day }));
-          if (payload) save({ days: { ...c.days, [day]: { at: Date.now(), data: slimProviders(payload) } } });
+          if (payload) save({ days: { ...c.days, [day]: { at: Date.now(), data: carryProviders(c.days[day], slimProviders(payload)) } } });
         }
         if (needs.copilot && (force || !c.copilot || Date.now() - c.copilot.at > PLAN_RANGE_STALE)) {
           const payload = await ask(localPlanArgs());
@@ -217,12 +218,14 @@ export default class CodeburnUsage extends View {
     const stale = !entry?.at || this.now - entry.at > 3 * STALE;
     const currency = s?.currency;
     const tip = [
-      s ? s.devices.map(d => `${d.name}: ${d.error ? `unreachable (${d.error})` : `${fmtCost(d.totals.cost, s.currency)} · ${fmtTokens(d.totals.totalTokens)}`}`).join("\n")
+      s ? s.devices.map(d => `${d.name}: ${d.error && !d.cachedAt ? `unreachable (${d.error})`
+        : `${fmtCost(d.totals.cost, s.currency)} · ${fmtTokens(d.totals.totalTokens)}${d.cachedAt ? ` (offline, cached ${fmtAgo(d.cachedAt, this.now)})` : ""}`}`).join("\n")
         : entry?.error ?? "codeburn usage",
       ...plans.map(p => `${p.name}: ${fmtCost(p.spent, currency)} of ${fmtBudget(p.budget, currency)} (${Math.round(p.percent)}%)`
         + (p.projected ? ` · projected ${fmtCost(p.projected, currency)}` : "")
         + (p.daysUntilReset !== null ? ` · ${resetText(p.daysUntilReset).toLowerCase()}` : "")
-        + (p.localOnly ? " · this device" : "")),
+        + (p.localOnly ? " · this device" : "")
+        + (p.cachedAt ? ` · cached data from ${fmtAgo(p.cachedAt, this.now)}` : "")),
     ].join("\n");
     // The content measures itself and the block is resized to it: 11 px left, then 11 px and a
     // 1 px separator on the right (the quota strip adds its own 11 px after it).
@@ -339,7 +342,7 @@ export default class CodeburnUsage extends View {
   scope(t, s) {
     const label = s.chosen
       ? `${s.chosen.name}${s.chosen.local ? " (this device)" : ""}`
-      : `All devices · ${s.reachable} of ${s.devices.length} reachable`;
+      : `All devices · ${s.reachable} of ${s.devices.length} reachable${s.cached ? ` · ${s.cached} cached` : ""}`;
     return h_flex().gap(8).items_center().text_size(11.5).pt(2)
       .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(`${s.label} · ${label}`))
       .when(!!s.chosen, el => el.child(h_flex().id("scope-all").flex_none().h(22).px(10).rounded(11).items_center()
@@ -365,10 +368,12 @@ export default class CodeburnUsage extends View {
   // Each plan's API-equivalent spend against its budget, for this budget window (not the range chips).
   plans(t, plans, currency) {
     const offline = Math.max(0, ...plans.map(p => p.offline));
+    const cachedAt = plans.reduce((a, p) => p.cachedAt && (a === null || p.cachedAt < a) ? p.cachedAt : a, null);
+    const note = [...(offline > 0 ? [`${offline} offline`] : []), ...(cachedAt ? [`cached ${fmtAgo(cachedAt, this.now)}`] : [])].join(" · ");
     return v_flex().gap(6)
       .child(h_flex().gap(6).items_center()
         .child(this.title(t, "Plans · all devices"))
-        .when(offline > 0, el => el.child(div().pt(6).text_size(11.5).text_color(t.blocked).child(`${offline} offline`)))
+        .when(!!note, el => el.child(div().pt(6).text_size(11.5).text_color(t.blocked).child(note)))
         .when(this.planBusy, el => el.child(div().pt(6).text_size(11.5).text_color(t.dim).child("updating…"))))
       .when(!!this.planError, el => el.child(div().text_size(11).text_color(t.blocked).truncate().child(`Plan refresh failed: ${this.planError}`)))
       .children(plans.map((p, i) => {
@@ -416,7 +421,9 @@ export default class CodeburnUsage extends View {
   }
 
   devices(t, s) {
-    const total = s.devices.reduce((a, d) => a + (d.error ? 0 : d.totals.totalTokens), 0);
+    // Offline devices with cached numbers count like reachable ones.
+    const counted = d => !d.error || !!d.cachedAt;
+    const total = s.devices.reduce((a, d) => a + (counted(d) ? d.totals.totalTokens : 0), 0);
     return v_flex().gap(4)
       .child(this.title(t, "Devices"))
       .child(this.numHeader(t, "Device", [[COL.req, "Req"], [COL.tokens, "Tokens"], [COL.cost, "Cost"]]))
@@ -428,16 +435,18 @@ export default class CodeburnUsage extends View {
           .on_click(() => setShared("codeburn-usage.device", on ? ALL : d.id))
           .child(h_flex().gap(4).text_size(12)
             .child(h_flex().flex_1().min_w(0).gap(5)
-              .child(div().min_w(0).truncate().text_color(d.error ? t.dim : t.foreground).child(d.name))
+              .child(div().min_w(0).truncate().text_color(counted(d) ? t.foreground : t.dim).child(d.name))
               .when(d.local, el => el.child(div().flex_none().text_size(11).text_color(t.dim).child("this device"))))
-            .when(!d.error, el => el
+            .when(counted(d), el => el
               .child(div().flex_none().w(COL.req).text_right().text_color(t.muted).child(fmtCount(d.totals.calls)))
               .child(div().flex_none().w(COL.tokens).text_right().child(fmtTokens(d.totals.totalTokens)))
               .child(div().flex_none().w(COL.cost).text_right().text_color(d.totals.cost > 0 ? t.done : t.dim)
                 .child(fmtCost(d.totals.cost, s.currency)))))
-          .child(d.error
-            ? div().text_size(11).text_color(t.blocked).truncate().child(`unreachable: ${d.error}`)
-            : this.bar(t, total ? d.totals.totalTokens / total : 0));
+          .child(counted(d)
+            ? this.bar(t, total ? d.totals.totalTokens / total : 0)
+            : div().text_size(11).text_color(t.blocked).truncate().child(`unreachable: ${d.error}`))
+          .when(!!d.error && !!d.cachedAt, el => el.child(div().text_size(11).text_color(t.blocked).truncate()
+            .child(`offline · cached ${fmtAgo(d.cachedAt, this.now)}`)));
       }));
   }
 

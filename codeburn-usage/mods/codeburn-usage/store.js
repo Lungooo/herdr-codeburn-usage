@@ -49,6 +49,31 @@ export function slim(payload) {
   };
 }
 
+// A device codeburn couldn't reach this time keeps its numbers from `prev` (the cache entry this
+// answer replaces), marked `cachedAt`: when they were last read. Today's numbers only count today.
+export function carryOver(prev, next, now, period) {
+  const per = next?.combined?.perDevice;
+  if (!prev?.payload || !Array.isArray(per) || !per.some(d => d.error)) return next;
+  const old = new Map((prev.payload.combined?.perDevice ?? []).map(d => [d.id, d]));
+  const details = new Map((prev.payload.combinedDevices ?? []).map(d => [d.id, d.payload]));
+  const since = new Map();
+  for (const d of per) {
+    const o = old.get(d.id);
+    if (!d.error || !o || (o.error && !o.cachedAt)) continue;
+    const at = o.cachedAt ?? prev.at;
+    if (period === "today" && localDate(new Date(at)) !== localDate(new Date(now))) continue;
+    since.set(d.id, at);
+  }
+  if (since.size === 0) return next;
+  return {
+    ...next,
+    combined: { ...next.combined, perDevice: per.map(d => since.has(d.id)
+      ? { ...old.get(d.id), name: d.name, error: d.error, cachedAt: since.get(d.id) } : d) },
+    ...(next.combinedDevices ? { combinedDevices: next.combinedDevices.map(d => since.has(d.id) && details.get(d.id)
+      ? { ...d, payload: details.get(d.id) } : d) } : {}),
+  };
+}
+
 function localTotals(cur) {
   const t = {
     cost: n(cur?.cost), calls: n(cur?.calls), sessions: n(cur?.sessions),
@@ -67,17 +92,18 @@ export function devicesOf(payload) {
   if (!Array.isArray(per) || per.length === 0)
     return [{ id: "local", name: "this device", local: true, totals: localTotals(payload?.current), payload }];
   return per.map(d => ({
-    id: d.id, name: d.name, local: !!d.local, error: d.error,
+    id: d.id, name: d.name, local: !!d.local, error: d.error, cachedAt: d.cachedAt,
     totals: { ...ZERO, ...Object.fromEntries(Object.keys(ZERO).map(k => [k, n(d[k])])) },
     payload: d.local ? payload : details.get(d.id),
   }));
 }
 
-// What the panel shows for one device id, or ALL for every reachable one.
+// What the panel shows for one device id, or ALL for every reachable one (and every offline one
+// with cached numbers).
 export function summarize(payload, device = ALL) {
   const devices = devicesOf(payload);
   const chosen = devices.find(d => d.id === device);
-  const picked = chosen ? [chosen] : devices.filter(d => !d.error);
+  const picked = chosen ? [chosen] : devices.filter(d => !d.error || d.cachedAt);
   const totals = { ...ZERO };
   for (const d of picked) for (const k of Object.keys(ZERO)) totals[k] += d.totals[k];
 
@@ -107,6 +133,7 @@ export function summarize(payload, device = ALL) {
   return {
     devices, chosen: chosen ?? null, totals, models: modelRows, projects,
     reachable: devices.filter(d => !d.error).length,
+    cached: devices.filter(d => d.error && d.cachedAt).length,
     hitRate: totals.inputTokens + totals.cacheReadTokens > 0
       ? totals.cacheReadTokens / (totals.inputTokens + totals.cacheReadTokens) : 0,
     label: payload?.current?.label ?? "",
@@ -184,18 +211,30 @@ export function planNeeds(plans, now) {
 
 // Per device, only what plan math reads: its cost per provider.
 export function slimProviders(payload) {
-  return { devices: devicesOf(payload).map(d => ({ id: d.id, name: d.name, local: d.local, ...(d.error ? { error: d.error } : {}), providers: d.payload?.current?.providers ?? null })) };
+  return { devices: devicesOf(payload).map(d => ({ id: d.id, name: d.name, local: d.local, ...(d.error ? { error: d.error } : {}), ...(d.cachedAt ? { cachedAt: d.cachedAt } : {}), providers: d.payload?.current?.providers ?? null })) };
 }
 
-// One provider's cost over the reachable devices ("all": every provider).
+// A range or day entry's devices that were unreachable this time keep their providers from `prev`
+// (the entry it replaces), marked `cachedAt` as in carryOver.
+export function carryProviders(prev, next) {
+  const old = new Map((prev?.data?.devices ?? []).map(d => [d.id, d]));
+  return { devices: next.devices.map(d => {
+    const o = old.get(d.id);
+    return d.error && o?.providers ? { ...d, providers: o.providers, cachedAt: o.cachedAt ?? prev.at } : d;
+  }) };
+}
+
+// One provider's cost over the reachable devices and the offline ones with cached numbers
+// ("all": every provider). `cachedAt` is the oldest cached number used.
 export function providerSpend(data, provider) {
-  let cost = 0, offline = 0, missing = !data;
+  let cost = 0, offline = 0, missing = !data, cachedAt = null;
   for (const d of data?.devices ?? []) {
-    if (d.error) { offline += 1; continue; }
+    if (d.error && !d.cachedAt) { offline += 1; continue; }
     if (!d.providers) { missing = true; continue; }
+    if (d.cachedAt) cachedAt = Math.min(cachedAt ?? d.cachedAt, d.cachedAt);
     cost += provider === "all" ? Object.values(d.providers).reduce((a, v) => a + n(v), 0) : n(d.providers[provider]);
   }
-  return { cost, offline, missing };
+  return { cost, offline, missing, cachedAt };
 }
 
 function median(values) {
@@ -216,12 +255,12 @@ export function planUsages(cache, today, now, currency = { rate: 1 }) {
     const base = { plan, name: planName(plan, currency), provider: plan.provider, budget: plan.monthlyUsd };
     if (plan.provider === "copilot") {
       const c = cache.copilot?.plan, rate = n(currency.rate) || 1;
-      if (!c) return { ...base, localOnly: true, incomplete: true, spent: 0, percent: 0, status: "under", ratio: 0, projected: 0, daysUntilReset: null, periodEnd: null, offline: 0 };
+      if (!c) return { ...base, localOnly: true, incomplete: true, spent: 0, percent: 0, status: "under", ratio: 0, projected: 0, daysUntilReset: null, periodEnd: null, offline: 0, cachedAt: null };
       // codeburn's json output is in the display currency; the mod keeps USD.
       return { ...base, localOnly: true, incomplete: false, spent: n(c.spent) / rate, budget: n(c.budget) / rate,
         percent: n(c.percentUsed), status: c.status ?? planStatus(n(c.percentUsed)), ratio: n(c.spent) / Math.max(n(c.budget), 1),
         projected: n(c.projectedMonthEnd) / rate, daysUntilReset: c.daysUntilReset ?? null,
-        periodEnd: c.periodEnd ? new Date(c.periodEnd) : null, offline: 0 };
+        periodEnd: c.periodEnd ? new Date(c.periodEnd) : null, offline: 0, cachedAt: null };
     }
     const { start, end } = planPeriod(plan.resetDay, now);
     const startKey = localDate(start);
@@ -247,6 +286,7 @@ export function planUsages(cache, today, now, currency = { rate: 1 }) {
       projected: spent + median(dayCosts) * Math.max(0, daysUntilReset - 1),
       daysUntilReset, periodEnd: end,
       offline: Math.max(0, ...sources.map(s => s.offline)),
+      cachedAt: sources.reduce((a, s) => s.cachedAt && (a === null || s.cachedAt < a) ? s.cachedAt : a, null),
       incomplete: sources.some(s => s.missing),
     };
   });
