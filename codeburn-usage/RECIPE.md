@@ -27,8 +27,11 @@ the rest of the bar, text 11.5 px in `muted`:
 - Hovering shows a tooltip with one line per device (`server: $75.95 · 161.22M`, or
   `unreachable (<error>)`) and `Click for details (ctrl-shift-u)`.
 
-**Dialog.** 760 px wide and 85% of the window tall, centered, in Herdr's dialog frame. It has a
-`surface` background and `foreground` text. Top to bottom:
+**Dialog.** A centered panel that fits its content: exactly as wide as the six totals tiles
+plus 16 px on each side (about 440 px), and as tall as everything in it, up to 85% of the
+window; past that the scroll area scrolls while header, chips and footer stay. It draws its own
+frame: `surface` background, `foreground` text, 1 px `border`, radius 8, a large shadow. Before
+any numbers exist it is 380 px wide. Top to bottom:
 
 - **Header,** 40 px, 16 px side padding, 1 px `border` line under it:
   - `Token usage` at 13 px semibold
@@ -41,13 +44,15 @@ the rest of the bar, text 11.5 px in `muted`:
   - The chosen chip is `selected` with `foreground` text and turns `accent` on hover.
   - The others are `raised` with `muted` text and turn `selected`/`foreground` on hover.
   - All four show a pointer cursor.
-- **Scroll area,** 16 px side padding, 10 px between blocks, ending in a 12 px bottom pad:
+- **Scroll area** (no visible scrollbar), 16 px side padding, 10 px between blocks, ending in a 12 px bottom pad:
   - **Scope line,** 11.5 px in `muted`: `Last 30 Days · All devices · 3 of 3 reachable`, or
     one device's name with `(this device)` for the local one. While narrowed to one device,
     an `All devices` pill at the right resets it.
-  - **Six tiles** in two rows of three, 16 px apart: `Total tokens`, `Input`, `Output` /
-    `Cache read`, `Requests`, `Cost`. Each is an 11.5 px `dim` label over a 14 px value.
-    `Cost` is `done` when above zero. Values truncate rather than wrap.
+  - **Six tiles** in three columns 24 px apart, 10 px between the rows: `Total tokens` over
+    `Cache read`, `Input` over `Requests`, `Output` over `Cost`. Each column is as wide as its
+    widest label or value, at least 120 px (so model names keep room beside the number columns),
+    and this table sets the dialog's width. Each tile is an 11.5 px `dim` label over a 14 px
+    value. `Cost` is `done` when above zero.
   - **Cache hit rate:** the label, a 3 px rounded bar (track `raised`, fill `accent`) and a
     46 px right-aligned percentage with one decimal.
   - **Models:**
@@ -66,7 +71,7 @@ the rest of the bar, text 11.5 px in `muted`:
     - Rows have 4 px padding and radius 4. The chosen row is `selected`; others turn `hover`
       on hover.
   - **Projects · this device:**
-    - A header row: `Project`, `Sessions` (one 140 px column), `Cost`.
+    - A header row: `Project`, `Sessions` (84 px, under the `Tokens` column), `Cost`.
     - Up to 10 rows, 20 px tall: the folder with your home written as `~` (in `muted`,
       truncating), the session count, and the cost.
     - Only shown for all devices or the local one, since codeburn never shares project rows
@@ -109,7 +114,9 @@ the only graphics. Nothing animates.
 ## Built from
 
 - **`mods/codeburn-usage/mod.json`:**
-  `{"place":"none","title":"Token usage","overlay":{"kind":"dialog","width":760,"height":0.85}}`.
+  `{"place":"none","title":"Token usage","overlay":{"kind":"dialog","frame":"none","width":1,"height":1}}`:
+  a frameless dialog over the whole window. The mod's root fills it, centers the panel and
+  closes the overlay on a press outside the panel (the panel stops its own presses).
   The dialog is what `mod.open` opens. The status item is the same mod placed in a layout
   block with `props: {"bar": true}`.
 - **`mods/codeburn-usage/store.js`.** Plain logic with no imports, so Node can run it to
@@ -165,6 +172,15 @@ the only graphics. Nothing animates.
 
 ## Watch out
 
+- **Sizing to content.** A plain dialog's width only comes from `mod.json` (a width set in the
+  mod is ignored), and a body with `flex_1` collapses to nothing when the dialog sizes to its
+  content. So the overlay covers the window frameless and the mod sizes its own panel:
+  - Width: an invisible copy of the totals table (`h(0)`, clipped) is the only child with a
+    width of its own; every other child is `w(0).min_w_full()`, so it adds nothing to the
+    panel's width and then fills it.
+  - Height: the panel has `max_h("85%")`; the scroll area is `flex_shrink(1).min_h(0)` with
+    plain `overflow_y_scroll()`. `overflow_y_scrollbar()` measures 0 tall there, and so does
+    `flex_1()`.
 - **Redraws are expensive while the dialog is open.** With it open, each whole-window redraw
   took 0.5–1 s on the machine this was built on; with it closed, 7–100 ms. Running codeburn and
   parsing its output don't block the UI thread (`exec` measured clean); the redraws do. That

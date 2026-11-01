@@ -1,1 +1,1 @@
-{ "place": "none", "title": "Token usage", "overlay": { "kind": "dialog", "width": 760, "height": 0.85 } }
+{ "place": "none", "title": "Token usage", "overlay": { "kind": "dialog", "frame": "none", "width": 1, "height": 1 } }

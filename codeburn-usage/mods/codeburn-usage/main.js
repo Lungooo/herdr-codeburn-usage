@@ -11,6 +11,7 @@ const TICK = 15000, STALE = 60000;
 const MODELS = 12, PROJECTS = 10;
 // Fixed numeric columns so rows line up in a proportional UI font.
 const COL = { req: 56, tokens: 84, cost: 76 };
+const STAT_COL = 120;
 
 // The status-bar copy (layout props `{"bar": true}`) always shows today, every device.
 const isBar = () => !!props()?.bar;
@@ -102,11 +103,22 @@ export default class CodeburnUsage extends View {
     if (isBar()) return this.strip(t, entry, s);
     if (entry?.at) this.tickStamp(entry.at, cx);
 
-    return v_flex().id("root").size_full().bg(t.surface).text_color(t.foreground)
-      .child(this.header(t, entry))
-      .child(this.chips(t, period))
-      .child(s ? this.body(t, s) : this.empty(t, entry))
-      .child(this.footer(t, entry, s));
+    // The overlay covers the whole window without Herdr's frame; the panel draws its own and sizes
+    // to its content: as wide as the totals table (an invisible copy of it, the only child with a
+    // width of its own), as tall as everything up to 85% of the window, past that the body scrolls.
+    const fill = el => el.w(0).min_w_full();
+    const panel = v_flex().id("panel").flex_none().max_h("85%").overflow_hidden()
+      .bg(t.surface).text_color(t.foreground).border(1).border_color(t.border).rounded(8).shadow_lg()
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .when(!s, el => el.w(380))
+      .when(!!s, el => el.child(this.stats(t, s).flex_none().h(0).px(16).overflow_hidden()))
+      .child(fill(this.header(t, entry)))
+      .child(fill(this.chips(t, period)))
+      .child(fill(s ? this.body(t, s) : this.empty(t, entry)))
+      .child(fill(this.footer(t, entry, s)));
+    return div().id("root").size_full().flex().items_center().justify_center()
+      .on_mouse_down("left", () => closeOverlay(props()?.overlay))
+      .child(panel);
   }
 
   // One line in the status bar: today's spend and tokens over every device. Click for the panel.
@@ -188,21 +200,28 @@ export default class CodeburnUsage extends View {
   empty(t, entry) {
     const text = this.busy ? "Asking codeburn…"
       : entry?.error ? `codeburn failed: ${entry.error}` : "No codeburn data yet";
-    return v_flex().flex_1().px(16).py(8).text_size(11.5).text_color(t.dim).child(text);
+    return v_flex().px(16).py(8).pb(16).text_size(11.5).text_color(t.dim).child(text);
+  }
+
+  // The totals, three columns as wide as their widest value (at least STAT_COL); the panel is as
+  // wide as this. The minimum leaves the model and device names room beside the number columns.
+  stats(t, s) {
+    const tile = (label, value, color) => v_flex().gap(1)
+      .child(div().text_size(11.5).text_color(t.dim).child(label))
+      .child(div().text_size(14).text_color(color ?? t.foreground).child(value));
+    const col = (...tiles) => v_flex().flex_none().min_w(STAT_COL).gap(10).children(tiles);
+    const T = s.totals;
+    return h_flex().gap(24)
+      .child(col(tile("Total tokens", fmtTokens(T.totalTokens)), tile("Cache read", fmtTokens(T.cacheReadTokens))))
+      .child(col(tile("Input", fmtTokens(T.inputTokens)), tile("Requests", fmtCount(T.calls))))
+      .child(col(tile("Output", fmtTokens(T.outputTokens)), tile("Cost", fmtCost(T.cost, s.currency), T.cost > 0 ? t.done : t.dim)));
   }
 
   body(t, s) {
-    const cur = s.currency;
-    const tile = (label, value, color) => v_flex().flex_1().min_w(0).gap(1)
-      .child(div().text_size(11.5).text_color(t.dim).truncate().child(label))
-      .child(div().text_size(14).truncate().text_color(color ?? t.foreground).child(value));
-    const row = (...tiles) => h_flex().gap(16).children(tiles);
-    const T = s.totals;
-
-    return v_flex().id("scroll").flex_1().min_h(0).overflow_y_scrollbar().px(16).pb(12).gap(10)
+    // A plain scroll: inside a panel sized by its content, overflow_y_scrollbar's wrapper measures 0 tall.
+    return v_flex().id("scroll").flex_shrink(1).min_h(0).overflow_y_scroll().px(16).pb(12).gap(10)
       .child(this.scope(t, s))
-      .child(row(tile("Total tokens", fmtTokens(T.totalTokens)), tile("Input", fmtTokens(T.inputTokens)), tile("Output", fmtTokens(T.outputTokens))))
-      .child(row(tile("Cache read", fmtTokens(T.cacheReadTokens)), tile("Requests", fmtCount(T.calls)), tile("Cost", fmtCost(T.cost, cur), T.cost > 0 ? t.done : t.dim)))
+      .child(this.stats(t, s))
       .child(h_flex().gap(8).items_center().text_size(11.5)
         .child(div().flex_none().text_color(t.dim).child("Cache hit rate"))
         .child(this.bar(t, s.hitRate).flex_1())
@@ -286,11 +305,11 @@ export default class CodeburnUsage extends View {
     const rows = s.projects.slice(0, PROJECTS), h = home();
     return v_flex().gap(2)
       .child(this.title(t, "Projects · this device"))
-      .child(this.numHeader(t, "Project", [[COL.req + COL.tokens, "Sessions"], [COL.cost, "Cost"]]))
+      .child(this.numHeader(t, "Project", [[COL.tokens, "Sessions"], [COL.cost, "Cost"]]))
       .when(rows.length === 0, el => el.child(div().text_size(11.5).text_color(t.dim).child("No project data in this range")))
       .children(rows.map(p => h_flex().h(20).gap(4).items_center().text_size(12)
         .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(tildify(p.path, h)))
-        .child(div().flex_none().w(COL.req + COL.tokens).text_right().text_color(t.dim).child(fmtCount(p.sessions)))
+        .child(div().flex_none().w(COL.tokens).text_right().text_color(t.dim).child(fmtCount(p.sessions)))
         .child(div().flex_none().w(COL.cost).text_right().text_color(p.cost > 0 ? t.done : t.dim).child(fmtCost(p.cost, s.currency)))));
   }
 
